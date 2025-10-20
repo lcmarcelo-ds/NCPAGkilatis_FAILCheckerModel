@@ -1,11 +1,3 @@
-# FAIL Checker Dashboard — Clean Edition (no sidebar mapping shown)
-# - No "Excel path" or "Column Mapping" UI.
-# - Auto-detects columns; shows a clear error if something is missing.
-# - Fix for AttributeError in top_entities (robust cost aggregation).
-# - Tabs: Overview, Compare, Green Flag, Siyam-siyam, Chop-chop, Dopplelganger, Ghost.
-# - Each category includes: per-DEO metrics table + map + raw table.
-# - Deduplicate by ProjectID (keep last).
-# - Uses Altair for bar charts and PyDeck for maps.
 
 import re
 from typing import Optional, List, Dict
