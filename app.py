@@ -1,3 +1,7 @@
+# Streamlit Dashboard for FAIL Checker Model Output
+# Author: ChatGPT
+# Description: Comprehensive dashboard with Overall section and per-category analyses,
+# including maps, distributions, top entities, and per-DEO metrics.
 
 import re
 import numpy as np
@@ -109,7 +113,7 @@ def detect_tag_col(df: pd.DataFrame):
         vals = df[c].dropna().astype(str).head(200).str.lower()
         if vals.empty:
             continue
-        if any(any(cat.lower() in v for cat in CATEGORIES) for v in vals):
+        if any(any(cat.lower() in v for v in vals) for cat in CATEGORIES):
             return c
     # Fallback: name-based
     return find_column(df, ["Tags", "Tagging", "FAIL_Tags", "FAIL_Tag", "Category", "Categories", "Labels"])
@@ -171,6 +175,46 @@ def compute_green_metrics(df: pd.DataFrame, deo_col: str, cost_col: str, tag_col
     out["green_flag_cost_ratio"] = np.where(out["total_contract_cost"] > 0,
                                             out["green_flag_contract_cost"] / out["total_contract_cost"], 0.0)
     out = out.sort_values(["green_flag_projects", "green_flag_density"], ascending=[False, False]).reset_index(drop=True)
+    return out
+
+def compute_category_metrics(df: pd.DataFrame, deo_col: str, cost_col: str, tag_col: str, category: str) -> pd.DataFrame:
+    """
+    Generic per-DEO metrics for any category (e.g., Siyam-siyam, Chop-chop, Dopplelganger, Ghost).
+    Outputs: total_projects, category_projects, total_contract_cost, category_contract_cost,
+             category_density, category_cost_ratio
+    """
+    work = df.copy()
+    pattern = fr"(^|;)\s*{re.escape(category)}\s*(;|$)"
+    work["_in_cat"] = work[tag_col].astype(str).str.contains(pattern, case=False, na=False)
+    work["_cost"] = ensure_numeric(work[cost_col]) if cost_col else 0
+
+    tot = work.groupby(deo_col, dropna=False).size().reset_index(name="total_projects")
+    cat_cnt = work.groupby(deo_col, dropna=False)["_in_cat"].sum().astype(int).reset_index(name="category_projects")
+
+    if cost_col:
+        costs = work.groupby(deo_col, dropna=False)["_cost"].sum().reset_index(name="total_contract_cost")
+        cat_costs = (
+            work[work["_in_cat"]]
+            .groupby(deo_col, dropna=False)["_cost"]
+            .sum()
+            .reset_index(name=f"{category}_contract_cost")
+        )
+    else:
+        costs = pd.DataFrame({deo_col: work[deo_col].unique(), "total_contract_cost": 0})
+        cat_costs = pd.DataFrame({deo_col: work[deo_col].unique(), f"{category}_contract_cost": 0})
+
+    out = (
+        tot.merge(cat_cnt, on=deo_col, how="left")
+           .merge(costs, on=deo_col, how="left")
+           .merge(cat_costs, on=deo_col, how="left")
+           .fillna({"category_projects": 0, f"{category}_contract_cost": 0, "total_contract_cost": 0})
+    )
+    out["category_projects"] = out["category_projects"].astype(int)
+    out["category_density"] = np.where(out["total_projects"] > 0,
+                                       out["category_projects"] / out["total_projects"], 0.0)
+    out["category_cost_ratio"] = np.where(out["total_contract_cost"] > 0,
+                                          out[f"{category}_contract_cost"] / out["total_contract_cost"], 0.0)
+    out = out.sort_values(["category_projects", "category_density"], ascending=[False, False]).reset_index(drop=True)
     return out
 
 def top_entities(df: pd.DataFrame, deo_col: str, contractor_col: str, cost_col: str | None, by="count", topn=15):
@@ -238,12 +282,34 @@ def category_section(category: str,
                      deo_col: str,
                      contractor_col: str,
                      cost_col: str):
-    st.subheader(f" {category} — Projects & Map")
+    st.subheader(f" {category} — Projects, Metrics, and Map")
 
     cat_df = filter_by_category_inclusive(df, tag_col, category)
     st.caption(f"{len(cat_df):,} projects currently tagged (including overlaps).")
 
+    # Per-DEO metrics table (mirrors Green Flag metrics)
+    if deo_col:
+        tmp = cat_df.rename(columns={
+            deo_col: "DistrictEngineeringOffice",
+            (cost_col or "ContractCost"): "ContractCost",
+            tag_col: "Tagging"
+        })
+        metrics = compute_category_metrics(tmp, "DistrictEngineeringOffice", "ContractCost", "Tagging", category)
+        st.markdown("##### Metrics per District Engineering Office")
+        st.dataframe(metrics[[
+            "DistrictEngineeringOffice",
+            "total_projects",
+            "category_projects",
+            "total_contract_cost",
+            f"{category}_contract_cost",
+            "category_density",
+            "category_cost_ratio"
+        ]])
+    else:
+        st.info("DistrictEngineeringOffice column not found — cannot compute per-DEO metrics.")
+
     # Map
+    st.markdown("##### Map")
     if lat_col and lon_col and lat_col in cat_df.columns and lon_col in cat_df.columns:
         st.pydeck_chart(pdk.Deck(
             map_style=None,
@@ -266,11 +332,12 @@ def category_section(category: str,
     else:
         st.info("Latitude/Longitude columns not found for mapping in this section.")
 
-    # Table
+    # Raw table for this category
+    st.markdown("##### Projects Table")
     st.dataframe(cat_df)
 
     # Top entities (count)
-    st.markdown("#### Top District Engineering Offices & Contractors (by Project Count)")
+    st.markdown("##### Top District Engineering Offices & Contractors (by Project Count)")
     ents = top_entities(cat_df, deo_col, contractor_col, cost_col, by="count", topn=15)
     cols = st.columns(2)
     if "DistrictEngineeringOffice" in ents:
@@ -282,7 +349,7 @@ def category_section(category: str,
 
     # Top entities (cost)
     if cost_col:
-        st.markdown("#### Top District Engineering Offices & Contractors (by Total Contract Cost)")
+        st.markdown("##### Top District Engineering Offices & Contractors (by Total Contract Cost)")
         ents_cost = top_entities(cat_df, deo_col, contractor_col, cost_col, by="cost", topn=15)
         cols2 = st.columns(2)
         if "DistrictEngineeringOffice" in ents_cost:
@@ -296,7 +363,7 @@ def category_section(category: str,
 # Sidebar — data & options
 # -------------------------------
 with st.sidebar:
-    st.title(" FAIL Checker Model")
+    st.title("🛰️ FAIL Checker Dashboard")
     data_path = st.text_input("Excel data path", DATA_PATH_DEFAULT)
     with st.expander("Settings", expanded=False):
         st.write("Map options and general preferences can be adjusted here in future versions.")
