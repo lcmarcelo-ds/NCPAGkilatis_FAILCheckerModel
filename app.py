@@ -5,6 +5,10 @@ import pandas as pd
 import streamlit as st
 import pydeck as pdk
 import altair as alt
+import os
+
+# ----- PyDeck/Streamlit stability fix -----
+os.environ["PYDECK_USE_LEGACY_API"] = "True"
 
 st.set_page_config(
     page_title="FAIL Checker Dashboard",
@@ -181,7 +185,13 @@ def map_layers_for_categories(df, lat_col, lon_col, tag_col, cats):
     return layers
 
 def deck_chart(layers, tooltip=None):
-    return pdk.Deck(initial_view_state=MAP_INITIAL_VIEW, layers=layers, tooltip=tooltip)
+    """Return a safe Deck object; avoid SessionInfo serialization crashes."""
+    try:
+        return pdk.Deck(initial_view_state=MAP_INITIAL_VIEW, layers=layers, tooltip=tooltip)
+    except Exception as e:
+        st.warning(f"Map rendering temporarily failed: {e}")
+        # Return an empty but valid deck object so the app continues to run
+        return pdk.Deck(initial_view_state=MAP_INITIAL_VIEW, layers=[], tooltip=tooltip)
 
 # ---------- Load data ----------
 try:
