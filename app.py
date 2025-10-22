@@ -6,11 +6,13 @@ import streamlit as st
 import pydeck as pdk
 import altair as alt
 
-st.set_page_config(page_title="FAIL Checker Dashboard", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="FAIL Checker Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# =============================================================
-# CONFIG
-# =============================================================
+# ---------- Configuration ----------
 DATA_PATH_DEFAULT = "FAIL_Checker_Model_Output.xlsx"
 
 CATEGORIES = [
@@ -20,172 +22,263 @@ CATEGORIES = [
     "Doppelganger_Project",
     "Ghost_Project",
 ]
-RED_SET = {"Siyam-siyam_Project","Chop_chop_Project","Doppelganger_Project","Ghost_Project"}
-CAT_COLOR = {
-    "Green_Flag": [18,152,66,190],
-    "Siyam-siyam_Project": [214,139,0,190],
-    "Chop_chop_Project": [189,28,28,190],
-    "Doppelganger_Project": [128,60,170,190],
-    "Ghost_Project": [32,96,168,190],
+GREEN_SET = {"Green_Flag"}
+RED_SET = {"Siyam-siyam_Project", "Chop_chop_Project", "Doppelganger_Project", "Ghost_Project"}
+
+CAT_COLOR: Dict[str, List[int]] = {
+    "Green_Flag": [18, 152, 66, 190],
+    "Siyam-siyam_Project": [214, 139, 0, 190],
+    "Chop_chop_Project":   [189, 28, 28, 190],
+    "Doppelganger_Project":[128, 60, 170, 190],
+    "Ghost_Project":       [32, 96, 168, 190],
 }
-MAP_INITIAL_VIEW = pdk.ViewState(latitude=12.8797, longitude=121.7740, zoom=5)
+MAP_INITIAL_VIEW = pdk.ViewState(latitude=12.8797, longitude=121.7740, zoom=5, pitch=0)
 
-# =============================================================
-# UTILS
-# =============================================================
+# ---------- Utilities ----------
 @st.cache_data(show_spinner=False)
-def load_data(path): return pd.read_excel(path)
+def load_data(path: str) -> pd.DataFrame:
+    return pd.read_excel(path)
 
-def normalize_columns(df):
-    return df.rename(columns={c:re.sub(r"\s+","_",c.strip()):c for c in df.columns})
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize DataFrame column names safely."""
+    new_cols = {c: re.sub(r"\s+", "_", str(c).strip()) for c in df.columns}
+    return df.rename(columns=new_cols)
 
-def find_column(df, candidates):
-    for c in df.columns:
-        if any(k.lower()==c.lower() for k in candidates): return c
-    for c in df.columns:
-        if any(k.lower() in c.lower() for k in candidates): return c
+def find_column(df: pd.DataFrame, candidates):
+    cols = list(df.columns)
+    # exact match
+    for c in candidates:
+        if c in cols:
+            return c
+    # case-insensitive
+    lower = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    # fuzzy contains
+    for c in cols:
+        lc = c.lower()
+        if any(k.lower() in lc for k in candidates):
+            return c
     return None
 
-def detect(df, keys):
-    return find_column(df, keys)
+# column detectors
+def detect_project_id_col(df):  return find_column(df, ["ProjectID", "Project_Id", "ProjID", "ProjectCode"])
+def detect_lat_lon_cols(df):    return find_column(df, ["Latitude","Lat"]), find_column(df, ["Longitude","Lon","Lng"])
+def detect_deo_col(df):         return find_column(df, ["DistrictEngineeringOffice","District_Engineering_Office","DEO"])
+def detect_contractor_col(df):  return find_column(df, ["Contractor","ContractorName","Supplier"])
+def detect_year_col(df):        return find_column(df, ["InfraYear","StartYear","CompletionYear"])
+def detect_cost_col(df):
+    col = find_column(df, ["ContractCost","ProjectCost","Contract_Amount","Total_Contract_Cost"])
+    if col: return col
+    nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return nums[0] if nums else None
+def detect_tag_col(df):
+    for c in df.columns:
+        vals = df[c].dropna().astype(str).head(400).str.lower()
+        if vals.empty:
+            continue
+        if any(any(cat.lower() in v for v in vals) for cat in CATEGORIES):
+            return c
+    return find_column(df, ["Tags","Tagging","Category","Labels"])
 
-def ensure_numeric(s): return pd.to_numeric(s, errors="coerce").fillna(0)
+def ensure_numeric(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0)
 
-def contains_category(s, cat):
-    return bool(re.search(fr"(^|;)\s*{re.escape(cat)}\s*(;|$)",str(s),re.I))
+def deduplicate_by_last(df: pd.DataFrame, key_col: Optional[str]) -> pd.DataFrame:
+    return df.drop_duplicates(subset=[key_col], keep="last") if key_col and key_col in df.columns else df
 
-def filter_inclusive(df, col, cat):
-    return df[df[col].astype(str).apply(lambda s:contains_category(s,cat))].copy()
+def explode_tags(df: pd.DataFrame, tag_col: str) -> pd.DataFrame:
+    t = df.copy()
+    t[tag_col] = t[tag_col].astype(str)
+    t["_tags_list"] = t[tag_col].str.split(r"\s*;\s*")
+    t = t.explode("_tags_list")
+    t["_tags_list"] = t["_tags_list"].str.strip()
+    t = t[t["_tags_list"].isin(CATEGORIES)]
+    return t.rename(columns={"_tags_list": "Tag"})
 
-def deck_chart(layers): return pdk.Deck(initial_view_state=MAP_INITIAL_VIEW, layers=layers)
+def contains_category(tag_string: str, category: str) -> bool:
+    return bool(re.search(fr"(^|;)\s*{re.escape(category)}\s*(;|$)", str(tag_string), flags=re.IGNORECASE))
 
-# =============================================================
-# LOAD
-# =============================================================
-df = normalize_columns(load_data(DATA_PATH_DEFAULT))
-proj_col = detect(df,["ProjectID"])
-deo_col  = detect(df,["DistrictEngineeringOffice"])
-lat_col  = detect(df,["Latitude"])
-lon_col  = detect(df,["Longitude"])
-cost_col = detect(df,["ContractCost","ApprovedBudgetForTheContract"])
-tag_col  = detect(df,["Project_Category","Tagging","FAIL_Tag"])
-if not all([proj_col,deo_col,lat_col,lon_col,cost_col,tag_col]):
-    st.error("Missing required columns.")
+def filter_inclusive(df: pd.DataFrame, tag_col: str, category: str) -> pd.DataFrame:
+    return df[df[tag_col].astype(str).apply(lambda s: contains_category(s, category))].copy()
+
+def add_year_if_missing(df: pd.DataFrame, year_col: Optional[str]):
+    if year_col:
+        return df, year_col
+    for c in df.columns:
+        if "date" in c.lower() or "year" in c.lower():
+            try:
+                d = pd.to_datetime(df[c], errors="coerce")
+                if d.notna().sum() > 0:
+                    df2 = df.copy()
+                    df2["__Year"] = d.dt.year
+                    return df2, "__Year"
+            except Exception:
+                continue
+    return df, None
+
+def alt_bar(df: pd.DataFrame, x_col: str, y_col: str, title: str, sort_col: Optional[str] = None, topn: Optional[int] = None):
+    d = df.copy()
+    if sort_col:
+        d = d.sort_values(sort_col, ascending=False)
+    if topn:
+        d = d.head(topn)
+    chart = (
+        alt.Chart(d)
+        .mark_bar()
+        .encode(
+            x=alt.X(y_col, title=y_col, type="quantitative"),
+            y=alt.Y(x_col, sort="-x", title=x_col),
+            tooltip=[x_col, y_col],
+        )
+        .properties(height=400, title=title)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def top_entities(df: pd.DataFrame, deo_col: Optional[str], contractor_col: Optional[str], cost_col: Optional[str], by="count", topn=15):
+    out = {}
+    if deo_col and deo_col in df.columns:
+        if by == "cost" and cost_col:
+            tmp = df.copy()
+            tmp["_cost"] = ensure_numeric(tmp[cost_col])
+            s = tmp.groupby(deo_col, dropna=False)["_cost"].sum().sort_values(ascending=False).head(topn)
+            out["DEO"] = s.reset_index(name="Total Cost")
+        else:
+            s = df.groupby(deo_col, dropna=False).size().sort_values(ascending=False).head(topn)
+            out["DEO"] = s.reset_index(name="Projects")
+    if contractor_col and contractor_col in df.columns:
+        if by == "cost" and cost_col:
+            tmp = df.copy()
+            tmp["_cost"] = ensure_numeric(tmp[cost_col])
+            s = tmp.groupby(contractor_col, dropna=False)["_cost"].sum().sort_values(ascending=False).head(topn)
+            out["Contractor"] = s.reset_index(name="Total Cost")
+        else:
+            s = df.groupby(contractor_col, dropna=False).size().sort_values(ascending=False).head(topn)
+            out["Contractor"] = s.reset_index(name="Projects")
+    return out
+
+def map_layers_for_categories(df, lat_col, lon_col, tag_col, cats):
+    layers = []
+    for cat in cats:
+        dd = df[df[tag_col].astype(str).apply(lambda s: contains_category(s, cat))]
+        dd = dd.dropna(subset=[lat_col, lon_col])
+        if dd.empty:
+            continue
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=dd,
+                get_position=[lon_col, lat_col],
+                get_radius=80,
+                pickable=True,
+                radius_min_pixels=3,
+                radius_max_pixels=8,
+                get_fill_color=CAT_COLOR.get(cat, [120,120,120,160]),
+                auto_highlight=True,
+            )
+        )
+    return layers
+
+def deck_chart(layers, tooltip=None):
+    return pdk.Deck(initial_view_state=MAP_INITIAL_VIEW, layers=layers, tooltip=tooltip)
+
+# ---------- Load data ----------
+try:
+    df_raw = load_data(DATA_PATH_DEFAULT)
+except Exception as e:
+    st.error(f"Failed to read Excel file '{DATA_PATH_DEFAULT}'. Error: {e}")
     st.stop()
 
-# =============================================================
-# STACKED CHART + DRILLDOWN HELPERS
-# =============================================================
-def _has_cat(series, token):
-    pat = rf"(?:^|;)\s*{re.escape(token)}\s*(?:;|$)"
-    return series.fillna("").str.contains(pat,regex=True,case=False)
+df = normalize_columns(df_raw)
+proj_col = detect_project_id_col(df)
+lat_col, lon_col = detect_lat_lon_cols(df)
+deo_col = detect_deo_col(df)
+contractor_col = detect_contractor_col(df)
+cost_col = detect_cost_col(df)
+tag_col = detect_tag_col(df)
+year_col = detect_year_col(df)
 
-def stacked_deo_share_chart(df, deo_col, tag_col, category, topn=20):
-    non_green = {"Siyam-siyam_Project","Chop_chop_Project","Doppelganger_Project","Ghost_Project"}
-    if category=="Green_Flag":
-        is_active = ~df[tag_col].fillna("").str.contains("|".join(map(re.escape,non_green)),case=False)
-        a_label,o_label="Green","Red"
-    else:
-        is_active = _has_cat(df[tag_col],category)
-        a_label,o_label=category.replace("_"," "), "Others"
-    tmp=df[[deo_col]].copy(); tmp["bucket"]=np.where(is_active,a_label,o_label)
-    agg=tmp.groupby([deo_col,"bucket"]).size().rename("count").reset_index()
-    totals=agg.groupby(deo_col)["count"].sum().rename("total").reset_index()
-    data=agg.merge(totals,on=deo_col); keep=totals.sort_values("total",ascending=False).head(topn)[deo_col]
-    data=data[data[deo_col].isin(keep)]; data["share"]=100*data["count"]/data["total"].replace({0:np.nan})
-    color_range=["#2ecc71","#e74c3c"] if category=="Green_Flag" else ["#e67e22","#bdc3c7"]
-    chart=(alt.Chart(data).mark_bar().encode(
-        x=alt.X("share:Q",title="Share (%)",stack="normalize"),
-        y=alt.Y(f"{deo_col}:N",sort="-x",title="DEO"),
-        color=alt.Color("bucket:N",scale=alt.Scale(domain=[a_label,o_label],range=color_range)),
-        tooltip=[deo_col,"bucket","count","share"]
-    ).properties(height=450))
-    return chart
+missing = []
+if tag_col is None: missing.append("Tag/Category column (Green_Flag, etc.)")
+if lat_col is None or lon_col is None: missing.append("Latitude/Longitude")
+if deo_col is None: missing.append("DistrictEngineeringOffice")
+if missing:
+    st.error("Missing required columns: " + "; ".join(missing))
+    st.stop()
 
-def _linkify_projects(df, deo_col, count_col, category):
-    out=df.copy()
-    label=f"{count_col}_label"
-    out[label]=out[count_col].apply(lambda x:f"{x:,}")
-    out[count_col]=out.apply(lambda r:f"?drill=1&deo={r[deo_col]}&cat={category}",axis=1)
-    return out,label
+df = deduplicate_by_last(df, proj_col)
+df, derived_year_col = add_year_if_missing(df, year_col)
+year_col = year_col or derived_year_col
+working = df.copy()
 
-def _drilldown_panel(df, deo_col, tag_col):
-    params=st.query_params
-    if params.get("drill")!="1": return
-    sel_deo=params.get("deo"); sel_cat=params.get("cat")
-    if not (sel_deo and sel_cat): return
-    cat_mask=_has_cat(df[tag_col],sel_cat)
-    deo_mask=df[deo_col].astype(str)==str(sel_deo)
-    rows=df.loc[deo_mask & cat_mask].copy()
-    st.subheader(f"Projects in {sel_deo} ({sel_cat})")
-    st.dataframe(rows,use_container_width=True,hide_index=True)
+# ---------- UI Tabs ----------
+tabs = st.tabs(["Overview", "Compare", "Green Flag", "Siyam-siyam", "Chop-chop", "Doppelganger", "Ghost"])
 
-# =============================================================
-# MAIN UI
-# =============================================================
-tabs=st.tabs(["Overview","Green Flag","Siyam-siyam","Chop-chop","Doppelganger","Ghost"])
-
-# ========== OVERVIEW ==========
+# ===== Overview =====
 with tabs[0]:
     st.header("Overview")
-    total=len(df)
-    exploded=(df.assign(Tag=df[tag_col].astype(str).str.split(";")).explode("Tag"))
-    counts=exploded["Tag"].value_counts().reindex(CATEGORIES,fill_value=0)
-    c1,c2,c3,c4=st.columns(4)
-    green=int(counts["Green_Flag"]); red=int(counts[list(RED_SET)].sum())
-    c1.metric("Projects",f"{total:,}")
-    c2.metric("Green",f"{green:,}")
-    c3.metric("Red",f"{red:,}")
-    c4.metric("Green Share",f"{(green/total*100 if total else 0):.1f}%")
+    total_projects = len(working)
+    exploded = explode_tags(working, tag_col)
+    tag_counts = exploded["Tag"].value_counts().reindex(CATEGORIES, fill_value=0)
+    green_count = int(tag_counts.get("Green_Flag", 0))
+    red_count = int(tag_counts.reindex(list(RED_SET), fill_value=0).sum())
+    green_share = (green_count / total_projects * 100) if total_projects > 0 else 0.0
 
-# ========== GREEN FLAG ==========
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Projects", f"{total_projects:,}")
+    c2.metric("Green Flag Projects", f"{green_count:,}")
+    c3.metric("Red-tagged Projects", f"{red_count:,}")
+    c4.metric("Green Share (%)", f"{green_share:.2f}")
+
+    dist_df = tag_counts.rename_axis("Tag").reset_index(name="Projects")
+    alt_bar(dist_df, x_col="Tag", y_col="Projects", title="Distribution of Tags", sort_col="Projects")
+
+    st.subheader("Comparison Map — Green vs Red")
+    d = working.copy()
+    d["_is_green"] = d[tag_col].astype(str).apply(lambda s: contains_category(s, "Green_Flag"))
+    d["_is_red"] = d[tag_col].astype(str).apply(lambda s: any(contains_category(s, c) for c in RED_SET))
+    greens = d[d["_is_green"] & d[lat_col].notna() & d[lon_col].notna()]
+    reds = d[d["_is_red"] & d[lat_col].notna() & d[lon_col].notna()]
+    deck = deck_chart(
+        layers=[
+            pdk.Layer("ScatterplotLayer", data=greens, get_position=[lon_col, lat_col],
+                      get_radius=80, pickable=True, get_fill_color=CAT_COLOR["Green_Flag"]),
+            pdk.Layer("ScatterplotLayer", data=reds, get_position=[lon_col, lat_col],
+                      get_radius=80, pickable=True, get_fill_color=[200, 40, 40, 190]),
+        ],
+        tooltip={"text": "{ProjectID}\n{DistrictEngineeringOffice}\n{Contractor}\n{Tagging}"}
+    )
+    st.pydeck_chart(deck)
+
+    st.subheader("Top Entities")
+    mode = st.radio("Rank by", ["Project Count", "Total Cost"], horizontal=True, index=0)
+    mode_key = "count" if mode == "Project Count" else "cost"
+    tops = top_entities(working, deo_col, contractor_col, cost_col, by=mode_key, topn=15)
+    t1, t2 = st.columns(2)
+    if "DEO" in tops: t1.dataframe(tops["DEO"])
+    if "Contractor" in tops: t2.dataframe(tops["Contractor"])
+
+# ===== Compare =====
 with tabs[1]:
-    st.header("Green Flag Analysis")
-    deo_grp=df.groupby(deo_col,dropna=False)
-    gm=pd.DataFrame({
-        deo_col:deo_grp.size().index,
-        "total_projects":deo_grp.size().values,
-        "green_flag_projects":deo_grp[tag_col].apply(lambda x:x.apply(lambda s:contains_category(s,"Green_Flag")).sum()),
-        "total_contract_cost":deo_grp[cost_col].apply(lambda s:ensure_numeric(s).sum())
-    })
-    gm["green_flag_density"]=gm["green_flag_projects"]/gm["total_projects"]
-    gm_link,label=_linkify_projects(gm,deo_col,"green_flag_projects","Green_Flag")
-    st.data_editor(gm_link,use_container_width=True,hide_index=True,
-        column_config={
-            deo_col:st.column_config.TextColumn("DistrictEngineeringOffice"),
-            "total_projects":st.column_config.NumberColumn("total_projects",format="%,d"),
-            "green_flag_projects":st.column_config.LinkColumn("green_flag_projects",display_text="${"+label+"}"),
-            "total_contract_cost":st.column_config.NumberColumn("total_contract_cost",format="%,.2f"),
-            "green_flag_density":st.column_config.NumberColumn("green_flag_density",format=".3f"),
-            label:None
-        })
-    st.subheader("Green vs Red (Top 20 DEO)")
-    st.altair_chart(stacked_deo_share_chart(df,deo_col,tag_col,"Green_Flag",20),use_container_width=True)
-    _drilldown_panel(df,deo_col,tag_col)
+    st.header("Category Comparison Map")
+    layers = map_layers_for_categories(working, lat_col, lon_col, tag_col, CATEGORIES)
+    st.pydeck_chart(deck_chart(layers))
 
-# ========== CATEGORY TABS ==========
-def render_category(cat,container):
+# ===== Category Tabs (Green, Siyam, Chop, Doppelganger, Ghost) =====
+def render_category_tab(df_in, category, container):
     with container:
-        st.header(cat.replace("_"," "))
-        deo_grp=df.groupby(deo_col,dropna=False)
-        cm=pd.DataFrame({
-            deo_col:deo_grp.size().index,
-            "total_projects":deo_grp.size().values,
-            "category_projects":deo_grp[tag_col].apply(lambda x:x.apply(lambda s:contains_category(s,cat)).sum())
-        })
-        cm_link,label=_linkify_projects(cm,deo_col,"category_projects",cat)
-        st.data_editor(cm_link,use_container_width=True,hide_index=True,
-            column_config={
-                deo_col:st.column_config.TextColumn("DistrictEngineeringOffice"),
-                "total_projects":st.column_config.NumberColumn("total_projects",format="%,d"),
-                "category_projects":st.column_config.LinkColumn("category_projects",display_text="${"+label+"}"),
-                label:None
-            })
-        st.subheader(f"{cat} vs Others (Top 20 DEO)")
-        st.altair_chart(stacked_deo_share_chart(df,deo_col,tag_col,cat,20),use_container_width=True)
-        _drilldown_panel(df,deo_col,tag_col)
+        st.header(category.replace("_"," "))
+        filtered = filter_inclusive(df_in, tag_col, category)
+        count = len(filtered)
+        st.metric(f"{category} Projects", f"{count:,}")
 
-render_category("Siyam-siyam_Project",tabs[2])
-render_category("Chop_chop_Project",tabs[3])
-render_category("Doppelganger_Project",tabs[4])
-render_category("Ghost_Project",tabs[5])
+        st.dataframe(filtered)  # show details
+        layers = map_layers_for_categories(df_in, lat_col, lon_col, tag_col, [category])
+        st.pydeck_chart(deck_chart(layers))
+
+render_category_tab(working, "Green_Flag", tabs[2])
+render_category_tab(working, "Siyam-siyam_Project", tabs[3])
+render_category_tab(working, "Chop_chop_Project", tabs[4])
+render_category_tab(working, "Doppelganger_Project", tabs[5])
+render_category_tab(working, "Ghost_Project", tabs[6])
